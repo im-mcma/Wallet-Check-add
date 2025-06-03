@@ -1,11 +1,12 @@
 import os
 import asyncio
 import psutil
-from bitcoinlib.services.services import Service
 from telegram import Bot
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
+from bitcoinlib.wallets import WalletError
+from bitcoinlib.services.services import Service
 
 # تنظیمات
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -33,8 +34,11 @@ class WalletChecker:
 
     async def check_address(self, address):
         try:
-            info = service.getbalance(address)
-            balance = info['confirmed'] / 1e8
+            # دریافت اطلاعات آدرس (شامل بالانس تأییدشده)
+            info = service.getaddressinfo(address)
+            confirmed = info.get('balance', 0)
+            balance = float(confirmed) / 1e8
+
             self.stats['total'] += 1
             if balance > 0:
                 self.stats['positive'] += 1
@@ -42,14 +46,14 @@ class WalletChecker:
             else:
                 self.stats['zero'] += 1
                 text = f"⚠️ {address} | 0.00"
-        except Exception:
+        except Exception as e:
             self.stats['errors'] += 1
-            text = f"🚫 {address} | error"
+            text = f"🚫 {address} | error: {str(e)[:40]}"
         await self.send_message(text)
 
     async def check_all_addresses(self):
         if self._checking:
-            return "در حال حاضر در حال بررسی هستیم."
+            return "در حال بررسی هستیم"
         self._checking = True
 
         if not os.path.exists(INPUT_FILE):
@@ -61,7 +65,7 @@ class WalletChecker:
 
         for addr in addresses:
             await self.check_address(addr)
-            await asyncio.sleep(2)  # جلوگیری از Flood Control تلگرام
+            await asyncio.sleep(2)  # برای جلوگیری از Flood Control
 
         self._checking = False
         return "✅ بررسی تمام آدرس‌ها کامل شد."
@@ -98,8 +102,8 @@ async def stats():
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(checker.check_all_addresses())   # ← شروع خودکار بررسی آدرس‌ها
-    asyncio.create_task(checker.periodic_report())       # ← گزارش دوره‌ای
+    asyncio.create_task(checker.check_all_addresses())   # بررسی خودکار آدرس‌ها در شروع
+    asyncio.create_task(checker.periodic_report())       # گزارش دوره‌ای منابع
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=1000)
