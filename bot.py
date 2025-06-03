@@ -1,14 +1,12 @@
 import os
 import asyncio
 import psutil
+import aiohttp
 from telegram import Bot
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
-from bitcoinlib.wallets import WalletError
-from bitcoinlib.services.services import Service
 
-# تنظیمات
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 INPUT_FILE = 'rich.txt'
@@ -16,7 +14,6 @@ INPUT_FILE = 'rich.txt'
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("توکن یا چت آی‌دی تلگرام تنظیم نشده!")
 
-service = Service()
 app = FastAPI()
 
 class WalletChecker:
@@ -32,17 +29,26 @@ class WalletChecker:
         except Exception as e:
             print(f"خطا در ارسال پیام تلگرام: {e}")
 
+    async def get_balance_blockstream(self, address):
+        url = f"https://blockstream.info/api/address/{address}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"HTTP {resp.status}")
+                    data = await resp.json()
+                    return data.get("chain_stats", {}).get("funded_txo_sum", 0) - data.get("chain_stats", {}).get("spent_txo_sum", 0)
+        except Exception as e:
+            raise Exception(f"خطا در دریافت موجودی: {str(e)}")
+
     async def check_address(self, address):
         try:
-            # دریافت اطلاعات آدرس (شامل بالانس تأییدشده)
-            info = service.getaddressinfo(address)
-            confirmed = info.get('balance', 0)
-            balance = float(confirmed) / 1e8
-
+            balance_satoshi = await self.get_balance_blockstream(address)
+            balance_btc = balance_satoshi / 1e8
             self.stats['total'] += 1
-            if balance > 0:
+            if balance_btc > 0:
                 self.stats['positive'] += 1
-                text = f"✅ {address} | {balance:.8f} BTC"
+                text = f"✅ {address} | {balance_btc:.8f} BTC"
             else:
                 self.stats['zero'] += 1
                 text = f"⚠️ {address} | 0.00"
@@ -65,7 +71,7 @@ class WalletChecker:
 
         for addr in addresses:
             await self.check_address(addr)
-            await asyncio.sleep(2)  # برای جلوگیری از Flood Control
+            await asyncio.sleep(2)  # جلوگیری از محدودیت نرخ
 
         self._checking = False
         return "✅ بررسی تمام آدرس‌ها کامل شد."
@@ -102,8 +108,8 @@ async def stats():
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(checker.check_all_addresses())   # بررسی خودکار آدرس‌ها در شروع
-    asyncio.create_task(checker.periodic_report())       # گزارش دوره‌ای منابع
+    asyncio.create_task(checker.check_all_addresses())   # بررسی خودکار در شروع
+    asyncio.create_task(checker.periodic_report())       # گزارش منابع
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=1000)
