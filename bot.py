@@ -16,8 +16,8 @@ service = Service()
 
 input_file = 'rich.txt'
 
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+TELEGRAM_BOT_TOKEN = '8148185229:AAG5W4K4nvDH78K8id4YWKgqDD_bk03kKbw' 
+TELEGRAM_CHAT_ID = '-1002384004196' 
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("توکن ربات یا شناسه کانال تلگرام تنظیم نشده‌اند!")
