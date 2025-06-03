@@ -33,24 +33,25 @@ class WalletChecker:
 
     async def check_address(self, address):
         try:
-            info = service.getaddress(address)
-            balance = info.get('balance', 0) / 1e8
+            info = service.getbalance(address)
+            balance = info['confirmed'] / 1e8
             self.stats['total'] += 1
             if balance > 0:
                 self.stats['positive'] += 1
                 text = f"✅ {address} | {balance:.8f} BTC"
             else:
                 self.stats['zero'] += 1
-                text = f"⚠️ {address} | 0.00000000 BTC"
-        except Exception as e:
+                text = f"⚠️ {address} | 0.00"
+        except Exception:
             self.stats['errors'] += 1
-            text = f"🚫 {address} | error: {str(e)}"
+            text = f"🚫 {address} | error"
         await self.send_message(text)
 
     async def check_all_addresses(self):
         if self._checking:
             return "در حال حاضر در حال بررسی هستیم."
         self._checking = True
+
         if not os.path.exists(INPUT_FILE):
             self._checking = False
             return f"فایل {INPUT_FILE} پیدا نشد!"
@@ -60,10 +61,10 @@ class WalletChecker:
 
         for addr in addresses:
             await self.check_address(addr)
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)  # جلوگیری از Flood Control تلگرام
 
         self._checking = False
-        return "بررسی تمام آدرس‌ها کامل شد."
+        return "✅ بررسی تمام آدرس‌ها کامل شد."
 
     async def periodic_report(self):
         while True:
@@ -71,7 +72,7 @@ class WalletChecker:
             ram = psutil.virtual_memory().percent
             s = self.stats
             report = (
-                f"📊 مصرف CPU: {cpu:.1f}% | RAM: {ram:.1f}%\n"
+                f"📊 مصرف CPU: {cpu}% | RAM: {ram}%\n"
                 f"🪙 تعداد بررسی شده: {s['total']}\n"
                 f"✅ دارای موجودی: {s['positive']}\n"
                 f"⚠️ بدون موجودی: {s['zero']}\n"
@@ -97,9 +98,8 @@ async def stats():
 
 @app.on_event("startup")
 async def startup_event():
-    # شروع همزمان بررسی اولیه و گزارش‌دهی دوره‌ای
-    asyncio.create_task(checker.check_all_addresses())
-    asyncio.create_task(checker.periodic_report())
+    asyncio.create_task(checker.check_all_addresses())   # ← شروع خودکار بررسی آدرس‌ها
+    asyncio.create_task(checker.periodic_report())       # ← گزارش دوره‌ای
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=1000)
