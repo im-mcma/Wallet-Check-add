@@ -1,81 +1,87 @@
 import os
 import time
+import asyncio
 import threading
-from bitcoinlib.services.services import Service
-from colorama import init, Fore
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from flask import Flask, jsonify
 from queue import Queue
+from flask import Flask, jsonify
+from tqdm import tqdm
+from colorama import init, Fore
+from bitcoinlib.services.services import Service
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from telegram import Bot
 from telegram.error import RetryAfter, TelegramError
 
+# رنگ‌ها برای خروجی ترمینال
 init(autoreset=True)
 
+# بیت‌کوین سرویس
 service = Service()
 
+# فایل ورودی
 input_file = 'rich.txt'
 
-TELEGRAM_BOT_TOKEN = '8148185229:AAG5W4K4nvDH78K8id4YWKgqDD_bk03kKbw' 
-TELEGRAM_CHAT_ID = '-1002384004196' 
-
+# محیط تلگرام
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("توکن ربات یا شناسه کانال تلگرام تنظیم نشده‌اند!")
+    raise ValueError("توکن ربات یا شناسه تلگرام تنظیم نشده‌اند!")
 
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 app = Flask(__name__)
 
+# صف پیام و بافر گزارش‌های تجمیعی
 message_queue = Queue()
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+batch_logs = []
 
+# ارسال کننده async
+async def send_to_telegram(text):
+    sent = False
+    while not sent:
+        try:
+            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
+            sent = True
+        except RetryAfter as e:
+            wait_time = e.retry_after
+            print(Fore.YELLOW + f"⚠️ توقف به‌خاطر محدودیت نرخ: {wait_time} ثانیه")
+            await asyncio.sleep(wait_time)
+        except TelegramError as e:
+            print(Fore.RED + f"🚫 خطای تلگرام: {e}")
+            await asyncio.sleep(5)
+
+# مصرف‌کننده صف
 def telegram_sender_worker():
     while True:
         text = message_queue.get()
         if text is None:
             break
-        sent = False
-        while not sent:
-            try:
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-                sent = True
-            except RetryAfter as e:
-                wait_time = e.retry_after
-                print(Fore.YELLOW + f"⚠️ محدودیت نرخ تلگرام، توقف برای {wait_time} ثانیه")
-                time.sleep(wait_time)
-            except TelegramError as e:
-                print(Fore.RED + f"خطا در ارسال پیام: {e}")
-                time.sleep(5)
+        try:
+            asyncio.run(send_to_telegram(text))
+        except Exception as e:
+            print(Fore.RED + f"❌ خطا در ارسال پیام: {e}")
         message_queue.task_done()
 
-def enqueue_message(text):
-    message_queue.put(text)
+# ارسال هر ۱۰ دقیقه
+def telegram_sender_batch():
+    while True:
+        time.sleep(600)  # هر ۱۰ دقیقه
+        if batch_logs:
+            text = "<b>📊 گزارش ۱۰ دقیقه اخیر:</b>\n\n" + "\n".join(batch_logs)
+            try:
+                asyncio.run(send_to_telegram(text))
+            except Exception as e:
+                print(Fore.RED + f"❌ خطا در ارسال تجمیعی: {e}")
+            batch_logs.clear()
 
+# افزودن پیام
 def add_log(message: str):
-    enqueue_message(message)
+    message_queue.put(message)
+    batch_logs.append(message)
 
-def load_checked_addresses(file):
-    checked = set()
-    # چون قبلا دیگه خروجی نداریم، می‌تونیم فایل رو نگیریم، اما اگر خواستی می‌تونی آدرس‌های ورودی رو چک کنی تا تکراری نزنیم
-    # در اینجا برای سادگی، فقط فایل ورودی رو چک می‌کنیم که آدرس‌ها تکراری نباشن
-    if os.path.exists(file):
-        with open(file, 'r', encoding='utf-8') as f:
-            for line in f:
-                checked.add(line.strip())
-    return checked
-
-@app.route('/')
-def index():
-    return "<h2>اسکریپت بررسی آدرس‌ها فعال است ✅</h2>"
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok", "message": "Server is running"}), 200
-
+# بررسی آدرس‌ها
 def check_addresses_and_report():
-    # فقط بارگذاری آدرس‌های ورودی که تکراری نباشند
     checked_addresses = set()
-
     if not os.path.exists(input_file):
-        print(Fore.RED + f'❌ فایل ورودی "{input_file}" پیدا نشد.')
+        print(Fore.RED + f'❌ فایل "{input_file}" پیدا نشد.')
         return
 
     with open(input_file, 'r', encoding='utf-8') as f:
@@ -83,12 +89,13 @@ def check_addresses_and_report():
 
     total = len(addresses)
     if total == 0:
-        print(Fore.BLUE + "✅ هیچ آدرس جدیدی برای بررسی وجود ندارد.")
-        add_log("✅ هیچ آدرس جدیدی برای بررسی وجود ندارد.")
+        msg = "✅ هیچ آدرس جدیدی برای بررسی نیست."
+        print(Fore.BLUE + msg)
+        add_log(msg)
         return
 
-    print(Fore.MAGENTA + f'\n📦 شروع بررسی {total} آدرس جدید...\n' + '═' * 50)
-    add_log(f'📦 شروع بررسی {total} آدرس جدید...')
+    print(Fore.MAGENTA + f'\n📦 شروع بررسی {total} آدرس...\n' + '═' * 50)
+    add_log(f'📦 شروع بررسی {total} آدرس...')
 
     def check_address(address):
         try:
@@ -108,7 +115,6 @@ def check_addresses_and_report():
 
         for future in as_completed(futures):
             status, addr, bal = future.result()
-
             if status == 'rich':
                 msg = f'✅ {addr} موجودی: {bal:.8f} BTC'
             elif status == 'lose':
@@ -118,15 +124,26 @@ def check_addresses_and_report():
 
             pbar.set_postfix_str(msg)
             pbar.update()
-
             add_log(msg)
 
     print('═' * 50)
-    print(Fore.BLUE + f'🎯 پایان بررسی آدرس‌های جدید.')
+    end_msg = f'🎯 پایان بررسی آدرس‌ها.'
+    print(Fore.BLUE + end_msg)
     add_log('═' * 50)
-    add_log(f'🎯 پایان بررسی آدرس‌های جدید.')
+    add_log(end_msg)
 
+# روت وب
+@app.route('/')
+def index():
+    return "<h2>🟢 اسکریپت بررسی آدرس فعال است</h2>"
+
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "message": "Server is running"}), 200
+
+# اجرای اصلی
 if __name__ == '__main__':
     threading.Thread(target=check_addresses_and_report).start()
     threading.Thread(target=telegram_sender_worker, daemon=True).start()
+    threading.Thread(target=telegram_sender_batch, daemon=True).start()
     app.run(host='0.0.0.0', port=1000)
