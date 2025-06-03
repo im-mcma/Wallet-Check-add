@@ -1,170 +1,119 @@
 import os
-import time
-import threading
+import asyncio
 import psutil
 from bitcoinlib.services.services import Service
-from colorama import init, Fore
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-from flask import Flask, jsonify
-from queue import Queue
 from telegram import Bot
 from telegram.error import RetryAfter, TelegramError
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+import uvicorn
 
-init(autoreset=True)
-
-service = Service()
-
-input_file = 'rich.txt'
-
+# Config
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+INPUT_FILE = 'rich.txt'
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("Telegram bot token or chat ID not set!")
+    raise ValueError("Telegram token or chat ID not set!")
 
-app = Flask(__name__)
+service = Service()
+app = FastAPI()
 
-message_queue = Queue()
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+class WalletChecker:
+    def __init__(self, bot_token, chat_id):
+        self.bot = Bot(token=bot_token)
+        self.chat_id = chat_id
+        self.queue = asyncio.Queue()
+        self.stats = {
+            'total': 0,
+            'positive': 0,
+            'zero': 0,
+            'errors': 0
+        }
+        self._checking = False
 
-lock = threading.Lock()
-
-# آمار کلی
-stats = {
-    'total': 0,
-    'checked': 0,
-    'rich': 0,
-    'empty': 0,
-    'error': 0,
-}
-
-def telegram_sender_worker():
-    while True:
-        messages = message_queue.get()
-        if messages is None:
-            break
-        text = '\n'.join(messages)
-        sent = False
-        while not sent:
+    async def send_worker(self):
+        while True:
+            text = await self.queue.get()
             try:
-                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
-                sent = True
+                await self.bot.send_message(chat_id=self.chat_id, text=text)
             except RetryAfter as e:
-                wait_time = e.retry_after
-                print(Fore.YELLOW + f"⚠️ Telegram rate limit, sleeping for {wait_time} seconds")
-                time.sleep(wait_time)
+                await asyncio.sleep(e.retry_after)
+                await self.queue.put(text)  # requeue for retry
             except TelegramError as e:
-                print(Fore.RED + f"Error sending message: {e}")
-                time.sleep(5)
-        message_queue.task_done()
+                print(f"Telegram Error: {e}")
+            finally:
+                self.queue.task_done()
 
-def enqueue_messages_batch(lines, batch_size=20):
-    batch = []
-    for line in lines:
-        batch.append(line)
-        if len(batch) >= batch_size:
-            message_queue.put(batch)
-            batch = []
-    if batch:
-        message_queue.put(batch)
+    async def enqueue_message(self, msg):
+        await self.queue.put(msg)
 
-@app.route('/')
-def index():
-    return "<h2>Address checking script is running ✅</h2>"
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok", "message": "Server is running"}), 200
-
-def check_address(address):
-    global stats
-    try:
-        info = service.getbalance(address)
-        balance = info['confirmed'] / 1e8
-        with lock:
-            stats['checked'] += 1
+    async def check_address(self, address):
+        try:
+            info = service.getbalance(address)
+            balance = info['confirmed'] / 1e8
+            self.stats['total'] += 1
             if balance > 0:
-                stats['rich'] += 1
-                return f'✅ {address} | {balance:.8f} BTC'
+                self.stats['positive'] += 1
+                return f"✅ {address} | {balance:.8f} BTC"
             else:
-                stats['empty'] += 1
-                return f'⚠️ {address} | 0.00'
-    except Exception:
-        with lock:
-            stats['error'] += 1
-        return f'🚫 {address} | error'
+                self.stats['zero'] += 1
+                return f"⚠️ {address} | 0.00"
+        except Exception:
+            self.stats['errors'] += 1
+            return f"🚫 {address} | error"
 
-def check_addresses_and_report():
-    global stats
-    if not os.path.exists(input_file):
-        print(Fore.RED + f'❌ Input file "{input_file}" not found.')
-        return
+    async def check_all_addresses(self):
+        if self._checking:
+            return "Already checking"
+        self._checking = True
+        if not os.path.exists(INPUT_FILE):
+            self._checking = False
+            return f"Input file {INPUT_FILE} not found!"
 
-    with open(input_file, 'r', encoding='utf-8') as f:
-        addresses = [line.strip() for line in f if line.strip()]
+        with open(INPUT_FILE, 'r') as f:
+            addresses = [line.strip() for line in f if line.strip()]
 
-    stats['total'] = len(addresses)
-    if stats['total'] == 0:
-        print(Fore.BLUE + "✅ No new addresses to check.")
-        message_queue.put(["✅ No new addresses to check."])
-        return
+        for addr in addresses:
+            msg = await self.check_address(addr)
+            await self.enqueue_message(msg)
 
-    print(Fore.MAGENTA + f'\n📦 Starting check of {stats["total"]} addresses...\n' + '═' * 50)
-    message_queue.put([f'📦 Starting check of {stats["total"]} addresses...'])
+        self._checking = False
+        return "Check complete"
 
-    max_workers = min(20, stats['total'])
+    async def periodic_report(self):
+        while True:
+            cpu = psutil.cpu_percent()
+            ram = psutil.virtual_memory().percent
+            s = self.stats
+            report = (
+                f"📊 CPU: {cpu}% RAM: {ram}%\n"
+                f"🪙 Checked: {s['total']}, Positive: {s['positive']}, "
+                f"Zero: {s['zero']}, Errors: {s['errors']}"
+            )
+            await self.enqueue_message(report)
+            await asyncio.sleep(600)  # 10 minutes
 
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor, tqdm(total=stats['total'], unit="address") as pbar:
-        futures = {executor.submit(check_address, addr): addr for addr in addresses}
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
-            pbar.set_postfix_str(result)
-            pbar.update()
+checker = WalletChecker(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
-            # هر 20 پیام رو ارسال می‌کنیم
-            if len(results) >= 20:
-                enqueue_messages_batch(results)
-                results = []
+@app.get("/")
+async def root():
+    return {"status": "running", "message": "Wallet checker service is active."}
 
-    if results:
-        enqueue_messages_batch(results)
+@app.get("/check")
+async def manual_check():
+    result = await checker.check_all_addresses()
+    return JSONResponse({"message": result})
 
-    message_queue.put(['═' * 50, f'🎯 Finished checking addresses.'])
+@app.get("/stats")
+async def stats():
+    return JSONResponse(checker.stats)
 
-def periodic_report():
-    while True:
-        time.sleep(600)  # هر 10 دقیقه
+async def startup_event():
+    asyncio.create_task(checker.send_worker())
+    asyncio.create_task(checker.periodic_report())
 
-        cpu_percent = psutil.cpu_percent(interval=1)
-        ram_percent = psutil.virtual_memory().percent
+app.add_event_handler("startup", startup_event)
 
-        with lock:
-            total = stats['total']
-            checked = stats['checked']
-            rich = stats['rich']
-            empty = stats['empty']
-            error = stats['error']
-
-        progress_percent = (checked / total * 100) if total else 0
-
-        report_lines = [
-            f"📊 Summary Report (Every 10 minutes):",
-            f"Total addresses: {total}",
-            f"Checked: {checked}",
-            f"Rich (BTC > 0): {rich}",
-            f"Empty (0 BTC): {empty}",
-            f"Errors: {error}",
-            f"Progress: {progress_percent:.2f}%",
-            f"CPU usage: {cpu_percent}%",
-            f"RAM usage: {ram_percent}%",
-        ]
-        message_queue.put(report_lines)
-
-if __name__ == '__main__':
-    threading.Thread(target=check_addresses_and_report).start()
-    threading.Thread(target=telegram_sender_worker, daemon=True).start()
-    threading.Thread(target=periodic_report, daemon=True).start()
-    app.run(host='0.0.0.0', port=1000)
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=1000)
