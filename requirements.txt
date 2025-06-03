@@ -1,0 +1,6 @@
+bitcoinlib
+colorama
+tqdm
+requests
+flask
+python-telegram-bot
