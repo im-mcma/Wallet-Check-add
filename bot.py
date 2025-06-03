@@ -1,20 +1,20 @@
 import os
 import time
 import threading
-import queue
 from bitcoinlib.services.services import Service
 from colorama import init, Fore
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-import requests
 from flask import Flask, jsonify
+from queue import Queue
+from telegram import Bot
+from telegram.error import RetryAfter, TelegramError
 
 init(autoreset=True)
 
 service = Service()
 
 input_file = 'rich.txt'
-output_file = 'results.txt'
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
@@ -24,36 +24,26 @@ if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
 
 app = Flask(__name__)
 
-message_queue = queue.Queue()
+message_queue = Queue()
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-def send_telegram_message(token, chat_id, text):
-    url = f'https://api.telegram.org/bot{token}/sendMessage'
-    payload = {
-        'chat_id': chat_id,
-        'text': text,
-    }
-    try:
-        resp = requests.post(url, data=payload, timeout=10)
-        if resp.status_code == 429:
-            retry_after = int(resp.headers.get('Retry-After', '5'))
-            print(Fore.YELLOW + f"⚠️ محدودیت نرخ تلگرام، توقف برای {retry_after} ثانیه")
-            time.sleep(retry_after)
-            return False
-        return resp.status_code == 200
-    except Exception as e:
-        print(Fore.RED + f"خطا در ارسال پیام: {e}")
-        return False
-
-def telegram_sender_worker(token, chat_id):
+def telegram_sender_worker():
     while True:
         text = message_queue.get()
         if text is None:
             break
         sent = False
         while not sent:
-            sent = send_telegram_message(token, chat_id, text)
-            if not sent:
-                time.sleep(1)
+            try:
+                bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+                sent = True
+            except RetryAfter as e:
+                wait_time = e.retry_after
+                print(Fore.YELLOW + f"⚠️ محدودیت نرخ تلگرام، توقف برای {wait_time} ثانیه")
+                time.sleep(wait_time)
+            except TelegramError as e:
+                print(Fore.RED + f"خطا در ارسال پیام: {e}")
+                time.sleep(5)
         message_queue.task_done()
 
 def enqueue_message(text):
@@ -64,13 +54,12 @@ def add_log(message: str):
 
 def load_checked_addresses(file):
     checked = set()
+    # چون قبلا دیگه خروجی نداریم، می‌تونیم فایل رو نگیریم، اما اگر خواستی می‌تونی آدرس‌های ورودی رو چک کنی تا تکراری نزنیم
+    # در اینجا برای سادگی، فقط فایل ورودی رو چک می‌کنیم که آدرس‌ها تکراری نباشن
     if os.path.exists(file):
         with open(file, 'r', encoding='utf-8') as f:
             for line in f:
-                if '|' in line:
-                    checked.add(line.split('|')[0].strip())
-                else:
-                    checked.add(line.strip())
+                checked.add(line.strip())
     return checked
 
 @app.route('/')
@@ -82,7 +71,8 @@ def health():
     return jsonify({"status": "ok", "message": "Server is running"}), 200
 
 def check_addresses_and_report():
-    checked_addresses = load_checked_addresses(output_file)
+    # فقط بارگذاری آدرس‌های ورودی که تکراری نباشند
+    checked_addresses = set()
 
     if not os.path.exists(input_file):
         print(Fore.RED + f'❌ فایل ورودی "{input_file}" پیدا نشد.')
@@ -99,8 +89,6 @@ def check_addresses_and_report():
 
     print(Fore.MAGENTA + f'\n📦 شروع بررسی {total} آدرس جدید...\n' + '═' * 50)
     add_log(f'📦 شروع بررسی {total} آدرس جدید...')
-
-    results = []
 
     def check_address(address):
         try:
@@ -128,8 +116,6 @@ def check_addresses_and_report():
             else:
                 msg = f'🚫 {addr} خطا در بررسی'
 
-            results.append((status, addr, bal if bal is not None else 0))
-
             pbar.set_postfix_str(msg)
             pbar.update()
 
@@ -137,26 +123,10 @@ def check_addresses_and_report():
 
     print('═' * 50)
     print(Fore.BLUE + f'🎯 پایان بررسی آدرس‌های جدید.')
-    print(Fore.GREEN + f'✅ آدرس‌های دارای موجودی: {len([r for r in results if r[0]=="rich"])}')
-    print(Fore.YELLOW + f'⚠️ آدرس‌های بدون موجودی: {len([r for r in results if r[0]=="lose"])}')
-    print(Fore.RED + f'🚫 آدرس‌های خطا دار: {len([r for r in results if r[0]=="error"])}')
-
     add_log('═' * 50)
     add_log(f'🎯 پایان بررسی آدرس‌های جدید.')
-    add_log(f'✅ آدرس‌های دارای موجودی: {len([r for r in results if r[0]=="rich"])}')
-    add_log(f'⚠️ آدرس‌های بدون موجودی: {len([r for r in results if r[0]=="lose"])}')
-    add_log(f'🚫 آدرس‌های خطا دار: {len([r for r in results if r[0]=="error"])}')
-
-    with open(output_file, 'a', encoding='utf-8') as f_out:
-        for status, addr, bal in results:
-            if status == 'rich':
-                f_out.write(f'{addr} | rich | {bal:.8f}\n')
-            elif status == 'lose':
-                f_out.write(f'{addr} | lose | {bal:.8f}\n')
-            else:
-                f_out.write(f'{addr} | error | error\n')
 
 if __name__ == '__main__':
     threading.Thread(target=check_addresses_and_report).start()
-    threading.Thread(target=telegram_sender_worker, args=(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID), daemon=True).start()
+    threading.Thread(target=telegram_sender_worker, daemon=True).start()
     app.run(host='0.0.0.0', port=1000)
