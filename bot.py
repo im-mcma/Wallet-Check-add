@@ -1,149 +1,78 @@
 import os
+import json
 import time
-import asyncio
+import random
+import logging
 import threading
-from queue import Queue
-from flask import Flask, jsonify
-from tqdm import tqdm
-from colorama import init, Fore
-from bitcoinlib.services.services import Service
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from telegram import Bot
-from telegram.error import RetryAfter, TelegramError
+from bit import Key
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from flask import Flask
 
-# رنگ‌ها برای خروجی ترمینال
-init(autoreset=True)
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # e.g., "@your_channel"
 
-# بیت‌کوین سرویس
-service = Service()
+bot = Bot(token=TOKEN)
 
-# فایل ورودی
-input_file = 'rich.txt'
-
-# محیط تلگرام
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("توکن ربات یا شناسه تلگرام تنظیم نشده‌اند!")
-
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
 app = Flask(__name__)
+log_queue = []
 
-# صف پیام و بافر گزارش‌های تجمیعی
-message_queue = Queue()
-batch_logs = []
+# Read addresses from file
+with open("add.txt", "r") as f:
+    TARGET_ADDRESSES = set(line.strip() for line in f if line.strip())
 
-# ارسال کننده async
-async def send_to_telegram(text):
-    sent = False
-    while not sent:
-        try:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
-            sent = True
-        except RetryAfter as e:
-            wait_time = e.retry_after
-            print(Fore.YELLOW + f"⚠️ توقف به‌خاطر محدودیت نرخ: {wait_time} ثانیه")
-            await asyncio.sleep(wait_time)
-        except TelegramError as e:
-            print(Fore.RED + f"🚫 خطای تلگرام: {e}")
-            await asyncio.sleep(5)
-
-# مصرف‌کننده صف
-def telegram_sender_worker():
+def check_wallets():
+    logging.info(f"🎯 Scanning {len(TARGET_ADDRESSES)} target addresses...")
     while True:
-        text = message_queue.get()
-        if text is None:
-            break
-        try:
-            asyncio.run(send_to_telegram(text))
-        except Exception as e:
-            print(Fore.RED + f"❌ خطا در ارسال پیام: {e}")
-        message_queue.task_done()
+        key = Key()
+        address = key.address
+        private_key = key.to_wif()
+        if address in TARGET_ADDRESSES:
+            log = {
+                "match": True,
+                "address": address,
+                "private_key": private_key,
+                "time": time.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+            log_queue.append(log)
+        time.sleep(0.01)  # adjust for CPU
 
-# ارسال هر ۱۰ دقیقه
-def telegram_sender_batch():
+def send_logs_periodically():
     while True:
-        time.sleep(600)  # هر ۱۰ دقیقه
-        if batch_logs:
-            text = "<b>📊 گزارش ۱۰ دقیقه اخیر:</b>\n\n" + "\n".join(batch_logs)
-            try:
-                asyncio.run(send_to_telegram(text))
-            except Exception as e:
-                print(Fore.RED + f"❌ خطا در ارسال تجمیعی: {e}")
-            batch_logs.clear()
+        if log_queue:
+            messages = []
+            while log_queue:
+                log = log_queue.pop(0)
+                messages.append(log)
 
-# افزودن پیام
-def add_log(message: str):
-    message_queue.put(message)
-    batch_logs.append(message)
+            for log in messages:
+                send_match_log(log)
+        time.sleep(600)  # every 10 minutes
 
-# بررسی آدرس‌ها
-def check_addresses_and_report():
-    checked_addresses = set()
-    if not os.path.exists(input_file):
-        print(Fore.RED + f'❌ فایل "{input_file}" پیدا نشد.')
-        return
+def send_match_log(log):
+    text = (
+        f"🚨 <b>Match Found!</b>\n\n"
+        f"🔐 <b>Private Key:</b> <code>{log['private_key']}</code>\n"
+        f"📮 <b>Address:</b> <code>{log['address']}</code>\n"
+        f"🕒 <b>Time:</b> {log['time']}"
+    )
 
-    with open(input_file, 'r', encoding='utf-8') as f:
-        addresses = [line.strip() for line in f if line.strip() and line.strip() not in checked_addresses]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔍 View on Blockchain", url=f"https://www.blockchain.com/btc/address/{log['address']}")],
+        [InlineKeyboardButton("📋 Copy Private Key", callback_data=f"copy:{log['private_key']}")]
+    ])
 
-    total = len(addresses)
-    if total == 0:
-        msg = "✅ هیچ آدرس جدیدی برای بررسی نیست."
-        print(Fore.BLUE + msg)
-        add_log(msg)
-        return
+    bot.send_message(
+        chat_id=CHANNEL_ID,
+        text=text,
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
 
-    print(Fore.MAGENTA + f'\n📦 شروع بررسی {total} آدرس...\n' + '═' * 50)
-    add_log(f'📦 شروع بررسی {total} آدرس...')
+@app.route("/", methods=["GET", "HEAD"])
+def home():
+    return "✅ Wallet Checker Running"
 
-    def check_address(address):
-        try:
-            info = service.getbalance(address)
-            balance = info['confirmed'] / 1e8
-            if balance > 0:
-                return ('rich', address, balance)
-            else:
-                return ('lose', address, balance)
-        except Exception:
-            return ('error', address, None)
-
-    max_workers = min(20, total)
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor, tqdm(total=total, unit="آدرس") as pbar:
-        futures = {executor.submit(check_address, addr): addr for addr in addresses}
-
-        for future in as_completed(futures):
-            status, addr, bal = future.result()
-            if status == 'rich':
-                msg = f'✅ {addr} موجودی: {bal:.8f} BTC'
-            elif status == 'lose':
-                msg = f'⚠️ {addr} موجودی صفر'
-            else:
-                msg = f'🚫 {addr} خطا در بررسی'
-
-            pbar.set_postfix_str(msg)
-            pbar.update()
-            add_log(msg)
-
-    print('═' * 50)
-    end_msg = f'🎯 پایان بررسی آدرس‌ها.'
-    print(Fore.BLUE + end_msg)
-    add_log('═' * 50)
-    add_log(end_msg)
-
-# روت وب
-@app.route('/')
-def index():
-    return "<h2>🟢 اسکریپت بررسی آدرس فعال است</h2>"
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok", "message": "Server is running"}), 200
-
-# اجرای اصلی
-if __name__ == '__main__':
-    threading.Thread(target=check_addresses_and_report).start()
-    threading.Thread(target=telegram_sender_worker, daemon=True).start()
-    threading.Thread(target=telegram_sender_batch, daemon=True).start()
-    app.run(host='0.0.0.0', port=1000)
+if __name__ == "__main__":
+    threading.Thread(target=check_wallets).start()
+    threading.Thread(target=send_logs_periodically).start()
+    app.run(host="0.0.0.0", port=1000)
