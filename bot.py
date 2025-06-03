@@ -3,18 +3,17 @@ import asyncio
 import psutil
 from bitcoinlib.services.services import Service
 from telegram import Bot
-from telegram.error import RetryAfter, TelegramError
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
 
-# Config
+# تنظیمات
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
 INPUT_FILE = 'rich.txt'
 
 if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("Telegram token or chat ID not set!")
+    raise ValueError("توکن یا چت آی‌دی تلگرام تنظیم نشده!")
 
 service = Service()
 app = FastAPI()
@@ -23,30 +22,14 @@ class WalletChecker:
     def __init__(self, bot_token, chat_id):
         self.bot = Bot(token=bot_token)
         self.chat_id = chat_id
-        self.queue = asyncio.Queue()
-        self.stats = {
-            'total': 0,
-            'positive': 0,
-            'zero': 0,
-            'errors': 0
-        }
+        self.stats = {'total': 0, 'positive': 0, 'zero': 0, 'errors': 0}
         self._checking = False
 
-    async def send_worker(self):
-        while True:
-            text = await self.queue.get()
-            try:
-                await self.bot.send_message(chat_id=self.chat_id, text=text)
-            except RetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                await self.queue.put(text)  # requeue for retry
-            except TelegramError as e:
-                print(f"Telegram Error: {e}")
-            finally:
-                self.queue.task_done()
-
-    async def enqueue_message(self, msg):
-        await self.queue.put(msg)
+    async def send_message(self, text):
+        try:
+            await self.bot.send_message(chat_id=self.chat_id, text=text)
+        except Exception as e:
+            print(f"خطا در ارسال پیام تلگرام: {e}")
 
     async def check_address(self, address):
         try:
@@ -55,31 +38,31 @@ class WalletChecker:
             self.stats['total'] += 1
             if balance > 0:
                 self.stats['positive'] += 1
-                return f"✅ {address} | {balance:.8f} BTC"
+                text = f"✅ {address} | {balance:.8f} BTC"
             else:
                 self.stats['zero'] += 1
-                return f"⚠️ {address} | 0.00"
+                text = f"⚠️ {address} | 0.00"
         except Exception:
             self.stats['errors'] += 1
-            return f"🚫 {address} | error"
+            text = f"🚫 {address} | error"
+        await self.send_message(text)
 
     async def check_all_addresses(self):
         if self._checking:
-            return "Already checking"
+            return "در حال حاضر در حال بررسی هستیم."
         self._checking = True
         if not os.path.exists(INPUT_FILE):
             self._checking = False
-            return f"Input file {INPUT_FILE} not found!"
+            return f"فایل {INPUT_FILE} پیدا نشد!"
 
         with open(INPUT_FILE, 'r') as f:
             addresses = [line.strip() for line in f if line.strip()]
 
         for addr in addresses:
-            msg = await self.check_address(addr)
-            await self.enqueue_message(msg)
+            await self.check_address(addr)
 
         self._checking = False
-        return "Check complete"
+        return "بررسی تمام آدرس‌ها کامل شد."
 
     async def periodic_report(self):
         while True:
@@ -87,12 +70,14 @@ class WalletChecker:
             ram = psutil.virtual_memory().percent
             s = self.stats
             report = (
-                f"📊 CPU: {cpu}% RAM: {ram}%\n"
-                f"🪙 Checked: {s['total']}, Positive: {s['positive']}, "
-                f"Zero: {s['zero']}, Errors: {s['errors']}"
+                f"📊 مصرف CPU: {cpu}% | RAM: {ram}%\n"
+                f"🪙 تعداد بررسی شده: {s['total']}\n"
+                f"✅ دارای موجودی: {s['positive']}\n"
+                f"⚠️ بدون موجودی: {s['zero']}\n"
+                f"🚫 خطاها: {s['errors']}"
             )
-            await self.enqueue_message(report)
-            await asyncio.sleep(600)  # 10 minutes
+            await self.send_message(report)
+            await asyncio.sleep(600)  # هر 10 دقیقه
 
 checker = WalletChecker(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
@@ -109,11 +94,9 @@ async def manual_check():
 async def stats():
     return JSONResponse(checker.stats)
 
+@app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(checker.send_worker())
     asyncio.create_task(checker.periodic_report())
-
-app.add_event_handler("startup", startup_event)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=1000)
