@@ -7,3 +7,4 @@ python-telegram-bot
 psutil
 fastapi 
 uvicorn
+aiohttp
