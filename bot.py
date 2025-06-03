@@ -33,18 +33,18 @@ class WalletChecker:
 
     async def check_address(self, address):
         try:
-            info = service.getbalance(address)
-            balance = info['confirmed'] / 1e8
+            info = service.getaddress(address)
+            balance = info.get('balance', 0) / 1e8
             self.stats['total'] += 1
             if balance > 0:
                 self.stats['positive'] += 1
                 text = f"✅ {address} | {balance:.8f} BTC"
             else:
                 self.stats['zero'] += 1
-                text = f"⚠️ {address} | 0.00"
-        except Exception:
+                text = f"⚠️ {address} | 0.00000000 BTC"
+        except Exception as e:
             self.stats['errors'] += 1
-            text = f"🚫 {address} | error"
+            text = f"🚫 {address} | error: {str(e)}"
         await self.send_message(text)
 
     async def check_all_addresses(self):
@@ -60,6 +60,7 @@ class WalletChecker:
 
         for addr in addresses:
             await self.check_address(addr)
+            await asyncio.sleep(1)
 
         self._checking = False
         return "بررسی تمام آدرس‌ها کامل شد."
@@ -70,14 +71,14 @@ class WalletChecker:
             ram = psutil.virtual_memory().percent
             s = self.stats
             report = (
-                f"📊 مصرف CPU: {cpu}% | RAM: {ram}%\n"
+                f"📊 مصرف CPU: {cpu:.1f}% | RAM: {ram:.1f}%\n"
                 f"🪙 تعداد بررسی شده: {s['total']}\n"
                 f"✅ دارای موجودی: {s['positive']}\n"
                 f"⚠️ بدون موجودی: {s['zero']}\n"
                 f"🚫 خطاها: {s['errors']}"
             )
             await self.send_message(report)
-            await asyncio.sleep(600)  # هر 10 دقیقه
+            await asyncio.sleep(600)
 
 checker = WalletChecker(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
@@ -96,6 +97,8 @@ async def stats():
 
 @app.on_event("startup")
 async def startup_event():
+    # شروع همزمان بررسی اولیه و گزارش‌دهی دوره‌ای
+    asyncio.create_task(checker.check_all_addresses())
     asyncio.create_task(checker.periodic_report())
 
 if __name__ == "__main__":
