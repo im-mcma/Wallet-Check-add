@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: wallet-check-add
+    runtime: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: your-bot-token-here
+      - key: TELEGRAM_CHAT_ID
+        value: your-chat-id-here
+    plan: free
+    autoDeploy: true
+    env: python
